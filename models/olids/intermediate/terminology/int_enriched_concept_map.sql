@@ -11,7 +11,8 @@
 Enriched concept map: local source codes (EMIS/TPP and enumeration families)
 mapped to their canonical targets, one row per source concept - join-safe
 without any downstream dedupe. Snomed-as-source rows (OPCS, cluster maps) are excluded.
-Replaces retired SNOMED targets, repairs root targets and backfills missing EMIS mappings.
+Replaces retired SNOMED targets, repairs root targets, backfills missing EMIS mappings
+and bridges result units to the feed's UCUM map by code.
 */
 
 WITH sct_history AS (
@@ -130,7 +131,7 @@ missing_emis_mappings AS (
         TRUE AS is_primary,
         'emis-reference-backfill' AS equivalence,
         1 AS equivalence_rank,
-        NULL::DATE AS last_updated_date
+        NULL::TIMESTAMP_NTZ AS last_updated_date
     FROM emis_clinical AS emis_ref
     LEFT JOIN {{ ref('conformed_concept_map') }} AS cm
         ON emis_ref.concept_id = cm.source_concept_id
@@ -172,7 +173,7 @@ local_backfills AS (
         TRUE AS is_primary,
         'local-backfill' AS equivalence,
         1 AS equivalence_rank,
-        NULL::DATE AS last_updated_date
+        NULL::TIMESTAMP_NTZ AS last_updated_date
     FROM {{ ref('landing_concept') }} AS src
     INNER JOIN (
         {% for m in local_mappings %}
@@ -188,6 +189,117 @@ local_backfills AS (
     LEFT JOIN {{ ref('conformed_concept_map') }} AS cm
         ON src.concept_id = cm.source_concept_id
     WHERE cm.source_concept_id IS NULL
+),
+
+{#- Feed UCUM targets that are not usable as a unit and are dropped, so the unit
+    concept stays unmapped and keeps its source code:
+    [arb'U]      the feed's catch-all for unknown or unparseable units ('.', 'Unk UoM',
+                 score denominators such as '/12'), and for some case variants of real
+                 units ('ug/l', '10^9/l') whose other variants map correctly
+    U/wk         alcohol units per week coded as enzyme units
+    m[iU]        'mIU/L' with the per-litre dropped; 'miu/L' maps to m[IU]/L
+    10*6, 10*9, 10*12   counts with the volume dropped (truncated sources such as 'x10 9/') -#}
+{% set unusable_ucum_targets = ["[arb'U]", 'U/wk', 'm[iU]', '10*6', '10*9', '10*12'] %}
+
+{#- Real units the feed sends only to an unusable target. Applied by exact source code
+    and preferred over the feed map. -#}
+{% set unit_overrides = [
+    {'code': '*10^9/l', 'target_code': '10*9/L', 'target_display': 'billion per liter'},
+    {'code': 'x 10^12/l', 'target_code': '10*12/L', 'target_display': 'trillion per liter'},
+    {'code': 'm[iU]/L', 'target_code': 'm[IU]/L', 'target_display': 'milli international unit per liter'},
+    {'code': 'kIU/L', 'target_code': 'k[IU]/L', 'target_display': 'kilo international unit per liter'},
+    {'code': 'mm/Hg', 'target_code': 'mm[Hg]', 'target_display': 'millimeter of mercury'},
+    {'code': 'Cel', 'target_code': 'Cel', 'target_display': 'degree Celsius'},
+    {'code': '{breaths}/min', 'target_code': '{breaths}/min', 'target_display': 'breaths per minute'},
+    {'code': 'nanogram/ml', 'target_code': 'ng/mL', 'target_display': 'nanogram per milliliter'},
+    {'code': 'micmol/l', 'target_code': 'umol/L', 'target_display': 'micromole per liter'},
+    {'code': 'g/dl.', 'target_code': 'g/dL', 'target_display': 'gram per deciliter'},
+] %}
+
+unit_overrides AS (
+    {% for o in unit_overrides %}
+        SELECT
+            '{{ o.code }}' AS source_code,
+            '{{ o.target_code }}' AS target_code,
+            '{{ o.target_display }}' AS target_display
+        {% if not loop.last %}UNION ALL{% endif %}
+    {% endfor %}
+),
+
+ucum_map AS (
+    SELECT
+        source_code,
+        LOWER(TRIM(source_code)) AS folded_code,
+        target_concept_id,
+        target_code,
+        target_display,
+        target_system,
+        is_primary = 1 AS is_primary,
+        equivalence,
+        equivalence_rank,
+        last_updated_date
+    FROM {{ ref('conformed_concept_map') }}
+    WHERE
+        source_system = 'EMISandTPP_NumericUnit_cs'
+        AND target_code IS NOT NULL
+        AND target_code NOT IN (
+            {%- for t in unusable_ucum_targets %}
+            '{{ t | replace("'", "''") }}'{% if not loop.last %},{% endif %}
+            {%- endfor %}
+        )
+),
+
+ucum_folded AS (
+    -- case variants can map to different targets; fold only where every variant
+    -- with a usable target agrees (unusable targets are already dropped)
+    SELECT
+        folded_code,
+        source_code
+    FROM ucum_map
+    QUALIFY
+        COUNT(DISTINCT target_code) OVER (PARTITION BY folded_code) = 1
+        AND COUNT(target_code) OVER (PARTITION BY folded_code)
+        = COUNT(*) OVER (PARTITION BY folded_code)
+        AND ROW_NUMBER() OVER (
+            PARTITION BY folded_code ORDER BY source_code
+        ) = 1
+),
+
+unit_code_bridge AS (
+    -- observations reference EMIS_and_TPP_NumericUnit_cs concepts, but the feed
+    -- keys its UCUM map on a separate EMISandTPP_NumericUnit_cs concept set.
+    -- Bridge by code: local override first, then exact match, then unambiguous
+    -- case-insensitive match.
+    SELECT
+        src.concept_id AS source_concept_id,
+        src.code AS source_code,
+        src.display AS source_display,
+        src.system AS source_system,
+        IFF(ovr.source_code IS NULL, ucum.target_concept_id, NULL) AS target_concept_id,
+        COALESCE(ovr.target_code, ucum.target_code) AS target_code,
+        COALESCE(ovr.target_display, ucum.target_display) AS target_display,
+        'UCUM_UnitsOfMeasure_cs' AS target_system,
+        COALESCE(ucum.is_primary, TRUE) AS is_primary,
+        IFF(ovr.source_code IS NULL, ucum.equivalence, 'local-override') AS equivalence,
+        COALESCE(ucum.equivalence_rank, 1) AS equivalence_rank,
+        ucum.last_updated_date
+    FROM {{ ref('landing_concept') }} AS src
+    LEFT JOIN unit_overrides AS ovr
+        ON src.code = ovr.source_code
+    LEFT JOIN ucum_map AS exact_match
+        ON src.code = exact_match.source_code
+    LEFT JOIN ucum_folded AS folded_match
+        ON LOWER(TRIM(src.code)) = folded_match.folded_code
+    LEFT JOIN ucum_map AS ucum
+        ON
+            COALESCE(exact_match.source_code, folded_match.source_code)
+            = ucum.source_code
+    LEFT JOIN {{ ref('conformed_concept_map') }} AS cm
+        ON src.concept_id = cm.source_concept_id
+    WHERE
+        src.system = 'EMIS_and_TPP_NumericUnit_cs'
+        AND cm.source_concept_id IS NULL
+        AND COALESCE(ovr.target_code, ucum.target_code) IS NOT NULL
 ),
 
 unmapped_passthrough AS (
@@ -207,7 +319,7 @@ unmapped_passthrough AS (
         TRUE AS is_primary,
         'unmapped-passthrough' AS equivalence,
         99 AS equivalence_rank,
-        NULL::DATE AS last_updated_date
+        NULL::TIMESTAMP_NTZ AS last_updated_date
     FROM {{ ref('landing_concept') }} AS src
     LEFT JOIN {{ ref('conformed_concept_map') }} AS cm
         ON src.concept_id = cm.source_concept_id
@@ -267,6 +379,23 @@ unioned AS (
         equivalence_rank,
         last_updated_date
     FROM local_backfills
+
+    UNION ALL
+
+    SELECT
+        source_concept_id,
+        source_code,
+        source_display,
+        source_system,
+        target_concept_id,
+        target_code,
+        target_display,
+        target_system,
+        is_primary,
+        equivalence,
+        equivalence_rank,
+        last_updated_date
+    FROM unit_code_bridge
 
     UNION ALL
 
